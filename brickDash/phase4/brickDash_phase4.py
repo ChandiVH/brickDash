@@ -47,6 +47,8 @@ def init_log_file() -> Path:
         if not file_exists:
             writer.writerow(["timestamp", "raw_bricks", "adjusted_bricks", "event"])
 
+    return csv_path
+
 
 class BrickDashApp:
     def __init__(self, root: tk.Tk) -> None:
