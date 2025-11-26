@@ -45,9 +45,7 @@ def init_log_file() -> Path:
     with csv_path.open(mode="a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(["timestamp", "brick_count"])
-
-    return csv_path
+            writer.writerow(["timestamp", "raw_bricks", "adjusted_bricks", "event"])
 
 
 class BrickDashApp:
@@ -65,6 +63,12 @@ class BrickDashApp:
         self.bricks_cut_per_hour = []
         self.bricks_per_5min = {}
         self.start_bricks = None
+
+        # State machine for raw vs adjusted count
+        self.previous_raw = None  # last raw brickCount from PLC
+        self.offset = 0  # accumulated bricks before last reset
+        self.adjusted_bricks = 0  # continuous, corrected count
+        self.reset_count = 0  # number of resets detected this session
 
         # GUI setup
         self._build_gui()
@@ -99,38 +103,45 @@ class BrickDashApp:
 
     def logging_loop(self) -> None:
         while True:
-            bricks = self.fetch_data()
-            if bricks is not None:
+            raw = self.fetch_data()
+            if raw is not None:
                 now = datetime.now()
                 timestamp_str = now.strftime("%H:%M:%S")
 
-                # Update console and buffers
-                print(f"[Console Log] {timestamp_str} | Bricks Cut: {bricks}")
-                self.status_var.set(
-                    f"Last update {timestamp_str} | Bricks Cut: {bricks}"
+                # Detect resets or backwards jumps
+                event = "NORMAL"
+                if self.previous_raw is not None and raw < self.previous_raw:
+                    # PLC has reset or moved backwards significantly
+                    self.reset_count += 1
+                    self.offset += self.previous_raw
+                    event = "RESET_DETECTED"
+                    self.status_var.set(
+                        f"Reset {self.reset_count} detected at {timestamp_str}, continuing count"
+                    )
+                else:
+                    # Normal update
+                    self.status_var.set(
+                        f"Last update {timestamp_str} | Bricks Cut (raw): {raw}"
+                    )
+
+                # Compute adjusted continuous count
+                self.adjusted_bricks = self.offset + raw
+                self.previous_raw = raw
+
+                # Update console and in memory buffers
+                print(
+                    f"[Console Log] {timestamp_str} | Raw: {raw} | Adjusted: {self.adjusted_bricks} | Event: {event}"
                 )
 
+                # For plotting, use adjusted count
                 self.timestamps.append(timestamp_str)
-                self.bricks_cut_values.append(bricks)
-
-                # Log to CSV only if changed
-                if self.previous_logged_bricks != bricks:
-                    with self.csv_path.open(mode="a", newline="") as f:
-                        writer = csv.writer(f)
-                        writer.writerow(
-                            [now.strftime("%Y-%m-%d %H:%M:%S"), bricks]
-                        )
-                    self.previous_logged_bricks = bricks
-
-                # Initial reference value
-                if self.start_bricks is None:
-                    self.start_bricks = bricks
+                self.bricks_cut_values.append(self.adjusted_bricks)
 
                 # Rate per hour
                 if len(self.bricks_cut_values) >= 2:
                     diff = (
-                        self.bricks_cut_values[-1]
-                        - self.bricks_cut_values[-2]
+                            self.bricks_cut_values[-1]
+                            - self.bricks_cut_values[-2]
                     )
                     self.bricks_cut_per_hour.append(diff * 60)
                 else:
@@ -141,7 +152,21 @@ class BrickDashApp:
                 bucket = f"{now.hour:02d}:{minute:02d}"
                 if bucket not in self.bricks_per_5min:
                     self.bricks_per_5min[bucket] = []
-                self.bricks_per_5min[bucket].append(bricks)
+                self.bricks_per_5min[bucket].append(self.adjusted_bricks)
+
+                # Log to CSV if raw changed
+                if self.previous_logged_bricks != raw:
+                    with self.csv_path.open(mode="a", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(
+                            [
+                                now.strftime("%Y-%m-%d %H:%M:%S"),
+                                raw,
+                                self.adjusted_bricks,
+                                event,
+                            ]
+                        )
+                    self.previous_logged_bricks = raw
 
             time.sleep(POLL_INTERVAL_SECONDS)
 
