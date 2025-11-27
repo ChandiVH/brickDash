@@ -72,6 +72,9 @@ class BrickDashApp:
         self.adjusted_bricks = 0  # continuous, corrected count
         self.reset_count = 0  # number of resets detected this session
 
+        # Control flag for background thread
+        self.running = True
+
         # GUI setup
         self._build_gui()
 
@@ -104,7 +107,7 @@ class BrickDashApp:
             return None
 
     def logging_loop(self) -> None:
-        while True:
+        while self.running:
             raw = self.fetch_data()
             if raw is not None:
                 now = datetime.now()
@@ -220,6 +223,17 @@ class BrickDashApp:
         canvas = FigureCanvasTkAgg(self.fig, master=main_frame)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Handle window close event for clean shutdown
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self) -> None:
+        """Handle GUI window close event and shut down cleanly."""
+        self.status_var.set("Shutting down...")
+        self.running = False  # tells logging_loop to exit
+        # Give the thread one cycle to finish
+        # Then destroy the root window
+        self.root.after(100, self.root.destroy)
 
     # ---------- Plot updating ----------
 
