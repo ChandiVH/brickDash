@@ -13,6 +13,7 @@ import threading
 import time
 import csv
 import os
+import sys
 
 
 # Configuration
@@ -72,8 +73,10 @@ class BrickDashApp:
         self.adjusted_bricks = 0  # continuous, corrected count
         self.reset_count = 0  # number of resets detected this session
 
-        # Control flag for background thread
-        self.running = True
+        # Threading control
+        self.stop_event = threading.Event()
+        self.logging_thread: threading.Thread | None = None
+        self.data_lock = threading.Lock()
 
         # GUI setup
         self._build_gui()
@@ -89,6 +92,19 @@ class BrickDashApp:
             cache_frame_data=False,
         )
 
+    # ---------- Utility: thread-safe status updates ----------
+
+    def _set_status(self, msg: str) -> None:
+        """
+        Thread-safe way to update the status bar.
+        Schedules the actual set() on the Tk main thread.
+        """
+        try:
+            self.root.after(0, self.status_var.set, msg)
+        except Exception:
+            # Root might already be destroyed; ignore
+            pass
+
     # ---------- Data layer ----------
 
     def fetch_data(self) -> int | None:
@@ -103,11 +119,15 @@ class BrickDashApp:
             return bricks_cut
         except Exception as e:
             # Basic feedback in the GUI status label
-            self.status_var.set(f"Connection error: {e}")
+            self._set_status(f"Connection error: {e}")
             return None
 
     def logging_loop(self) -> None:
-        while self.running:
+        """
+        Background loop that polls the PLC and updates internal state.
+        Controlled via stop_event so we can shut it down quickly and cleanly.
+        """
+        while not self.stop_event.is_set():
             raw = self.fetch_data()
             if raw is not None:
                 now = datetime.now()
@@ -120,12 +140,12 @@ class BrickDashApp:
                     self.reset_count += 1
                     self.offset += self.previous_raw
                     event = "RESET_DETECTED"
-                    self.status_var.set(
+                    self._set_status(
                         f"Reset {self.reset_count} detected at {timestamp_str}, continuing count"
                     )
                 else:
                     # Normal update
-                    self.status_var.set(
+                    self._set_status(
                         f"Last update {timestamp_str} | Bricks Cut (raw): {raw}"
                     )
 
@@ -138,26 +158,28 @@ class BrickDashApp:
                     f"[Console Log] {timestamp_str} | Raw: {raw} | Adjusted: {self.adjusted_bricks} | Event: {event}"
                 )
 
-                # For plotting, use adjusted count
-                self.timestamps.append(timestamp_str)
-                self.bricks_cut_values.append(self.adjusted_bricks)
+                # Update data used by the plots
+                with self.data_lock:
+                    # For plotting, use adjusted count
+                    self.timestamps.append(timestamp_str)
+                    self.bricks_cut_values.append(self.adjusted_bricks)
 
-                # Rate per hour
-                if len(self.bricks_cut_values) >= 2:
-                    diff = (
+                    # Rate per hour
+                    if len(self.bricks_cut_values) >= 2:
+                        diff = (
                             self.bricks_cut_values[-1]
                             - self.bricks_cut_values[-2]
-                    )
-                    self.bricks_cut_per_hour.append(diff * 60)
-                else:
-                    self.bricks_cut_per_hour.append(0)
+                        )
+                        self.bricks_cut_per_hour.append(diff * 60)
+                    else:
+                        self.bricks_cut_per_hour.append(0)
 
-                # 5 minute bucket
-                minute = now.minute - (now.minute % 5)
-                bucket = f"{now.hour:02d}:{minute:02d}"
-                if bucket not in self.bricks_per_5min:
-                    self.bricks_per_5min[bucket] = []
-                self.bricks_per_5min[bucket].append(self.adjusted_bricks)
+                    # 5 minute bucket
+                    minute = now.minute - (now.minute % 5)
+                    bucket = f"{now.hour:02d}:{minute:02d}"
+                    if bucket not in self.bricks_per_5min:
+                        self.bricks_per_5min[bucket] = []
+                    self.bricks_per_5min[bucket].append(self.adjusted_bricks)
 
                 # Log to CSV if raw changed
                 if self.previous_logged_bricks != raw:
@@ -173,11 +195,24 @@ class BrickDashApp:
                         )
                     self.previous_logged_bricks = raw
 
-            time.sleep(POLL_INTERVAL_SECONDS)
+            # Wait for the next poll interval, but wake up early if we're shutting down
+            if self.stop_event.wait(POLL_INTERVAL_SECONDS):
+                break
+
+        # Optional: final status for debugging
+        self._set_status("Logger stopped")
 
     def _start_logging_thread(self) -> None:
-        t = threading.Thread(target=self.logging_loop, daemon=True)
-        t.start()
+        """
+        Start the logging thread as a non-daemon so that we control
+        its lifetime explicitly and can join it on shutdown.
+        """
+        self.logging_thread = threading.Thread(
+            target=self.logging_loop,
+            name="BrickDashLogger",
+            daemon=False,
+        )
+        self.logging_thread.start()
 
     # ---------- GUI layer ----------
 
@@ -227,56 +262,102 @@ class BrickDashApp:
         # Handle window close event for clean shutdown
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    # ---------- Shutdown handling ----------
+
+    def initiate_shutdown(self) -> None:
+        """
+        Signal background work to stop and start GUI teardown.
+        Safe to call multiple times.
+        """
+        if self.stop_event.is_set():
+            # Already shutting down
+            return
+
+        self.stop_event.set()
+
+        # Stop Matplotlib animation/timers so they don't keep scheduling callbacks
+        if hasattr(self, "ani") and self.ani is not None:
+            try:
+                self.ani.event_source.stop()
+            except Exception:
+                # Not fatal if this fails; worst case the process exits anyway
+                pass
+
+        # Poll for the logging thread to finish without blocking Tk
+        self._poll_logger_and_close()
+
+    def _poll_logger_and_close(self) -> None:
+        """
+        Keep checking the logging thread; when it's done, destroy the root window.
+        This avoids blocking the Tk event loop with a blocking join().
+        """
+        t = self.logging_thread
+        if t is not None and t.is_alive():
+            # Check again in 50 ms; Tk stays responsive during shutdown
+            self.root.after(50, self._poll_logger_and_close)
+        else:
+            # All background work is done, safe to destroy Tk
+            try:
+                # Close the Matplotlib figure explicitly to release any global refs
+                plt.close(self.fig)
+            except Exception:
+                pass
+            self.root.destroy()
+
     def _on_close(self) -> None:
         """Handle GUI window close event and shut down cleanly."""
-        self.status_var.set("Shutting down...")
-        self.running = False  # tells logging_loop to exit
-        # Give the thread one cycle to finish
-        # Then destroy the root window
-        self.root.after(100, self.root.destroy)
+        self._set_status("Shutting down...")
+        self.initiate_shutdown()
 
     # ---------- Plot updating ----------
 
     def update_plots(self, frame):
-        if len(self.bricks_cut_values) == 0:
-            return self.line1, self.line2
+        with self.data_lock:
+            if len(self.bricks_cut_values) == 0:
+                return self.line1, self.line2
 
-        # Plot 1: bricks cut
-        recent_vals = self.bricks_cut_values[-MAX_POINTS:]
-        self.line1.set_data(range(len(recent_vals)), recent_vals)
-        self.ax1.set_xlim(0, max(len(recent_vals), 10))
-        self.ax1.set_ylim(
-            min(recent_vals) - 1,
-            max(recent_vals) + 1,
-        )
+            # Plot 1: bricks cut
+            recent_vals = self.bricks_cut_values[-MAX_POINTS:]
+            x1 = range(len(recent_vals))
+            y1 = list(recent_vals)
 
-        # Plot 2: rate per hour
-        recent_hour = self.bricks_cut_per_hour[-MAX_POINTS:]
-        self.line2.set_data(range(len(recent_hour)), recent_hour)
-        self.ax2.set_xlim(0, max(len(recent_hour), 10))
-        self.ax2.set_ylim(
-            0,
-            max(recent_hour) + 10 if recent_hour else 10,
-        )
+            # Plot 2: rate per hour
+            recent_hour = self.bricks_cut_per_hour[-MAX_POINTS:]
+            x2 = range(len(recent_hour))
+            y2 = list(recent_hour)
 
-        # Plot 3: 5 minute buckets
-        bar_labels = list(self.bricks_per_5min.keys())[-10:]
-        bar_data = list(self.bricks_per_5min.values())[-10:]
-        bar_heights = [
-            (bucket_vals[-1] - bucket_vals[0]) / len(bucket_vals)
-            if len(bucket_vals) > 1
-            else 0
-            for bucket_vals in bar_data
-        ]
+            # Plot 3: 5 minute buckets
+            bar_labels = list(self.bricks_per_5min.keys())[-10:]
+            bar_data = list(self.bricks_per_5min.values())[-10:]
 
-        self.ax3.clear()
-        self.ax3.bar(bar_labels, bar_heights)
-        self.ax3.set_title("Bricks/min in 5 Minute Intervals")
-        self.ax3.set_ylabel("Avg Bricks/min")
-        self.ax3.set_xlabel("Time Blocks")
-        self.ax3.set_xticks(range(len(bar_labels)))
-        self.ax3.set_xticklabels(bar_labels, rotation=30, ha="right")
-        self.ax3.grid(True)
+        # Now update the plots outside the lock so we don't hold it during drawing
+        self.line1.set_data(x1, y1)
+        self.ax1.set_xlim(0, max(len(y1), 10))
+        self.ax1.set_ylim(min(y1) - 1, max(y1) + 1)
+
+        self.line2.set_data(x2, y2)
+        self.ax2.set_xlim(0, max(len(y2), 10))
+        self.ax2.set_ylim(0, max(y2) + 10 if y2 else 10)
+
+        # 5 minute buckets bar plot
+        if bar_labels:
+            bar_heights = []
+            for bucket_vals in bar_data:
+                if len(bucket_vals) > 1:
+                    bar_heights.append(
+                        (bucket_vals[-1] - bucket_vals[0]) / len(bucket_vals)
+                    )
+                else:
+                    bar_heights.append(0)
+
+            self.ax3.clear()
+            self.ax3.bar(range(len(bar_labels)), bar_heights)
+            self.ax3.set_title("Bricks/min in 5 Minute Intervals")
+            self.ax3.set_ylabel("Avg Bricks/min")
+            self.ax3.set_xlabel("Time Blocks")
+            self.ax3.set_xticks(range(len(bar_labels)))
+            self.ax3.set_xticklabels(bar_labels, rotation=30, ha="right")
+            self.ax3.grid(True)
 
         return self.line1, self.line2
 
@@ -284,7 +365,18 @@ class BrickDashApp:
 def main():
     root = tk.Tk()
     app = BrickDashApp(root)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        # Defensive cleanup in case something bypassed the close handler
+        app.stop_event.set()
+        t = app.logging_thread
+        if t is not None and t.is_alive():
+            # Give the logger a short grace period to exit
+            t.join(timeout=3)
+
+    # Normal, clean interpreter shutdown (no need for os._exit here)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
